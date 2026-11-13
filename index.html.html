@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="lt">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AR veido kaukė – operatyvininkas</title>
+<style>
+  body{margin:0;background:#12141f;color:#e6e9f2;font-family:system-ui,Segoe UI,Arial,sans-serif;display:flex;flex-direction:column;align-items:center}
+  h1{font-size:20px;margin:14px 10px 6px}
+  #stage{position:relative;width:min(96vw,720px);aspect-ratio:4/3;background:#000;border-radius:12px;overflow:hidden}
+  video,canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}
+  #msg{margin:10px;font-size:14px;color:#9fb3d9;text-align:center;max-width:680px}
+  button{font-size:17px;padding:12px 22px;border:0;border-radius:10px;background:#0aa0dc;color:#fff;cursor:pointer;margin:6px}
+  #ctl{display:none;width:min(92vw,520px);margin:6px 0 20px}
+  #ctl label{display:flex;justify-content:space-between;font-size:14px;margin-top:8px}
+  #ctl input{width:100%}
+</style>
+</head>
+<body>
+<h1>AR veido kaukė: kaukėtas operatyvininkas</h1>
+<div id="stage"><video id="v" playsinline muted></video><canvas id="c"></canvas></div>
+<div id="msg">Paspauskite „Paleisti“ ir leiskite naudoti kamerą. Reikia interneto.</div>
+<button id="go">Paleisti</button>
+<div id="ctl">
+  <label>Dydis <span id="sv"></span></label><input id="scale" type="range" min="0.5" max="1.6" step="0.01" value="0.9">
+  <label>Aukštyn / žemyn <span id="yv"></span></label><input id="oy" type="range" min="-8" max="8" step="0.1" value="2.5">
+  <label>Pirmyn / atgal <span id="zv"></span></label><input id="oz" type="range" min="-10" max="6" step="0.1" value="-3">
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script type="module">
+import { FaceLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm";
+
+const $ = id => document.getElementById(id);
+const video = $("v"), canvas = $("c"), msg = $("msg");
+
+// ---- three.js scena ----
+const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: true });
+renderer.setClearColor(0x000000, 0);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(63, 4 / 3, 1, 2000);
+scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+const dl = new THREE.DirectionalLight(0xffffff, 0.9); dl.position.set(0.3, 0.6, 1); scene.add(dl);
+
+const rig = new THREE.Group();            // sekamas pagal veido matricą
+rig.matrixAutoUpdate = false;
+scene.add(rig);
+const mask = new THREE.Group();           // pačios kaukės dalys (cm, galvos centras = 0,0,0, priekis = +Z)
+rig.add(mask);
+
+const mat = (r, g, b, glow) => new THREE.MeshStandardMaterial({
+  color: new THREE.Color(r, g, b), roughness: 0.55, metalness: 0.15, side: THREE.DoubleSide,
+  emissive: glow ? new THREE.Color(r, g, b) : 0x000000, emissiveIntensity: glow ? 1 : 0 });
+const M = { helm: mat(.18,.20,.17), mask: mat(.05,.05,.06), boot: mat(.08,.08,.08), acc: mat(.85,.85,.80), glow: mat(.95,.25,.15,true) };
+const PI = Math.PI;
+
+function ellip(m, c, r, t0, t1, p0, p1) {
+  const g = new THREE.SphereGeometry(1, 40, 28, p0, p1 - p0, t0, t1 - t0);
+  const o = new THREE.Mesh(g, m); o.scale.set(r[0], r[1], r[2]); o.position.set(c[0], c[1], c[2]); mask.add(o); return o;
+}
+function box(m, c, s) { const o = new THREE.Mesh(new THREE.BoxGeometry(s[0], s[1], s[2]), m); o.position.set(c[0], c[1], c[2]); mask.add(o); return o; }
+
+// Šalmas (viršutinė dalis)
+ellip(M.helm, [0, 2, -0.5], [9.4, 9.0, 10.2], 0, 1.12, 0, 2 * PI);
+// Kaukė apatinei veido daliai (tik priekis; akys lieka atviros)
+ellip(M.mask, [0, -6, 0.3], [7.9, 6.0, 8.6], 0.62, 3.0, PI / 2 - 1.25, PI / 2 + 1.25);
+// Juostelės ant kaukės
+[-1.6, 0, 1.6].forEach(x => box(M.acc, [x, -7, 9.0], [0.5, 2.8, 0.3]));
+// Šalmo kraštas
+box(M.boot, [0, 6.1, 9.2], [11, 0.7, 0.6]);
+// Ausinės + žibintai
+[-1, 1].forEach(s => {
+  const cy = new THREE.Mesh(new THREE.CylinderGeometry(3, 3, 2.2, 28), M.boot);
+  cy.rotation.z = PI / 2; cy.position.set(s * 9.6, 0, -0.5); mask.add(cy);
+  ellip(M.glow, [s * 10.9, 0, -0.5], [0.5, 0.5, 0.5], 0, PI, 0, 2 * PI);
+});
+// Šalmo laikiklis
+box(M.helm, [0, 9.4, 3], [3.2, 1.2, 3.6]);
+
+function applyTune() {
+  const s = +$("scale").value, y = +$("oy").value, z = +$("oz").value;
+  mask.scale.setScalar(s); mask.position.set(0, y, z);
+  $("sv").textContent = s.toFixed(2); $("yv").textContent = y.toFixed(1); $("zv").textContent = z.toFixed(1);
+}
+["scale", "oy", "oz"].forEach(id => $(id).addEventListener("input", applyTune));
+applyTune();
+
+// ---- veido sekimas (MediaPipe) ----
+let landmarker = null, lastT = -1;
+async function start() {
+  $("go").disabled = true; msg.textContent = "Kraunamas veido sekimo modelis…";
+  try {
+    const fileset = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    landmarker = await FaceLandmarker.createFromOptions(fileset, {
+      baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task", delegate: "GPU" },
+      runningMode: "VIDEO", numFaces: 1, outputFacialTransformationMatrixes: true });
+    msg.textContent = "Paleidžiama kamera…";
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user", width: 1280, height: 720 }, audio: false });
+    video.srcObject = stream; await video.play();
+    const w = video.videoWidth, h = video.videoHeight;
+    $("stage").style.aspectRatio = w + "/" + h;
+    renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix();
+    $("go").style.display = "none"; $("ctl").style.display = "block";
+    msg.textContent = "Pažiūrėkite į kamerą. Jei kaukė nesutampa su veidu, pakoreguokite slankiklius.";
+    loop();
+  } catch (e) {
+    console.error(e); $("go").disabled = false;
+    msg.textContent = "Klaida: " + (e && e.message ? e.message : e) + ". Reikia leisti kamerą ir interneto ryšio. Atidarykite per Chrome arba per https.";
+  }
+}
+function loop() {
+  requestAnimationFrame(loop);
+  if (video.currentTime !== lastT) {
+    lastT = video.currentTime;
+    const r = landmarker.detectForVideo(video, performance.now());
+    const m = r.facialTransformationMatrixes && r.facialTransformationMatrixes[0];
+    if (m) { rig.matrix.fromArray(m.data); rig.visible = true; } else { rig.visible = false; }
+  }
+  renderer.render(scene, camera);
+}
+$("go").addEventListener("click", start);
+</script>
+</body>
+</html>
